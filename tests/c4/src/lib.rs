@@ -577,7 +577,7 @@ fn test_submission_validity() {
     let user_asset_b_balance = setup.asset_b_token.balance(&setup.user);
     assert_eq!(
         user_asset_b_balance, 
-        USER_STARTING_BALANCE + borrow_amount, 
+        USER_STARTING_BALANCE + (borrow_amount as i128), 
         "Attacker did not receive stolen funds"
     );
 
