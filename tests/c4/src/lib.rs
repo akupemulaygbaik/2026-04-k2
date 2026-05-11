@@ -529,7 +529,7 @@ fn test_submission_validity() {
         &setup.user,
         &setup.asset_b,
         &borrow_amount,
-        &2u32, // Variable rate
+        &1u32, // Variable rate
         &0u32, // Referral
         &setup.user,
     );
